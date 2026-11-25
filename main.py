@@ -1,6 +1,11 @@
 import argparse
 import asyncio
 import logging
+import os
+import re
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -43,6 +48,53 @@ from forecasting_tools import (
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Free setup (no paid keys): OpenRouter ":free" models and Google News RSS.
+# A free OpenRouter account without credits cannot be charged; it allows
+# about 50 requests per day. Each question costs PREDICTIONS * 2 requests
+# (one forecast + one parse), so the bot stops after MAX_QUESTIONS_PER_RUN.
+# ---------------------------------------------------------------------------
+FREE_DEFAULT_MODEL = os.getenv(
+    "BOT_MODEL", "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+)
+FREE_PARSER_MODEL = os.getenv("BOT_PARSER", "openrouter/google/gemma-4-31b-it:free")
+PREDICTIONS = int(os.getenv("BOT_PREDICTIONS", "3"))
+MAX_QUESTIONS_PER_RUN = int(os.getenv("BOT_MAX_QUESTIONS", "4"))
+
+
+def _news_query(question: MetaculusQuestion) -> str:
+    text = re.sub(r"\[.*?\]|\(.*?\)", " ", question.question_text or "")
+    text = re.sub(r"^(Will|What|How many|How much|Which|Who|When|Is|Are|Does|Do)\s+", "", text.strip(), flags=re.I)
+    words = re.findall(r"[\w'.%$-]+", text)
+    return " ".join(words[:12])
+
+
+def google_news_headlines(question: MetaculusQuestion, limit: int = 15) -> str:
+    query = _news_query(question)
+    url = (
+        "https://news.google.com/rss/search?"
+        + urllib.parse.urlencode({"q": query + " when:30d", "hl": "en-US", "gl": "US", "ceid": "US:en"})
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (forecasting bot)"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            root = ET.fromstring(resp.read())
+    except Exception as e:  # research is optional: forecast without it
+        logger.warning(f"Google News failed for '{query}': {e}")
+        return ""
+    lines = []
+    for item in root.iter("item"):
+        title = (item.findtext("title") or "").strip()
+        date = (item.findtext("pubDate") or "").strip()[:16]
+        source = (item.findtext("source") or "").strip()
+        if title:
+            lines.append(f"- {date} | {title} ({source})")
+        if len(lines) >= limit:
+            break
+    if not lines:
+        return ""
+    return f"Recent news headlines (search: '{query}'):\n" + "\n".join(lines)
 
 
 class FallTemplateBot2026(ForecastBot):
@@ -124,7 +176,23 @@ class FallTemplateBot2026(ForecastBot):
         1  # Set this to whatever works for your search-provider/ai-model rate limits
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
-    _structure_output_validation_samples = 2
+    _structure_output_validation_samples = 1
+    _questions_left = MAX_QUESTIONS_PER_RUN  # shared across tournaments in one run
+
+    async def forecast_questions(self, questions, return_exceptions: bool = False):
+        pending = [
+            q
+            for q in questions
+            if not (self.skip_previously_forecasted_questions and q.already_forecasted)
+        ]
+        take = pending[: max(0, FallTemplateBot2026._questions_left)]
+        FallTemplateBot2026._questions_left -= len(take)
+        if len(pending) > len(take):
+            logger.info(
+                f"Cap: forecasting {len(take)} of {len(pending)} new questions this run "
+                f"(BOT_MAX_QUESTIONS={MAX_QUESTIONS_PER_RUN}); the rest go next run."
+            )
+        return await super().forecast_questions(take, return_exceptions)
 
     ##################################### RESEARCH #####################################
 
@@ -137,6 +205,9 @@ class FallTemplateBot2026(ForecastBot):
 
             if isinstance(researcher, GeneralLlm):
                 research = await researcher.invoke(prompt)
+            elif researcher == "googlenews/rss":
+                # Free research: recent Google News headlines (no key, no LLM call).
+                research = await asyncio.to_thread(google_news_headlines, question)
             elif (
                 researcher == "asknews/news-summaries"
                 or researcher == "asknews/deep-research/low-depth"
@@ -709,23 +780,23 @@ if __name__ == "__main__":
     # uncomment and edit to pin specific models.
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=PREDICTIONS,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms={
+            "default": GeneralLlm(
+                model=FREE_DEFAULT_MODEL,
+                temperature=0.3,
+                timeout=180,
+                allowed_tries=2,
+            ),
+            "summarizer": FREE_PARSER_MODEL,
+            "researcher": "googlenews/rss",
+            "parser": FREE_PARSER_MODEL,
+        },
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These
@@ -742,17 +813,19 @@ if __name__ == "__main__":
     # summary printers below.
     client = MetaculusClient()
     if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
-            )
-        )
+        # MiniBench first: it restarts every 2 weeks, so entering now is fair;
+        # the seasonal tournament gets whatever the cap leaves.
         minibench_reports = asyncio.run(
             template_bot.forecast_on_tournament(
                 client.CURRENT_MINIBENCH_ID, return_exceptions=True
             )
         )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
+        seasonal_tournament_reports = asyncio.run(
+            template_bot.forecast_on_tournament(
+                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+            )
+        )
+        forecast_reports = minibench_reports + seasonal_tournament_reports
     elif run_mode == "metaculus_cup":
         # The Metaculus Cup may be uninitialized near the start of a season
         # (Jan/May/Sep). MetaculusClient.ACX_2025_TOURNAMENT = 32564 and
