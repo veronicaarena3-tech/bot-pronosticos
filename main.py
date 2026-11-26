@@ -848,7 +848,12 @@ if __name__ == "__main__":
             )
         )
 
-    template_bot.log_report_summary(forecast_reports)
+    try:
+        template_bot.log_report_summary(forecast_reports)
+    except RuntimeError as e:
+        # Free models hit their daily limit often; unforecast questions are retried next run.
+        # Exit 0 so GitHub does not mail a failure every run.
+        logger.warning(f"Some questions failed this run (retried next run): {str(e)[:500]}")
     print_run_summary_banner(
         forecast_reports,
         will_publish=publish_to_metaculus,
