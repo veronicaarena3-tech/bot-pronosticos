@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 FREE_DEFAULT_MODEL = os.getenv(
     "BOT_MODEL", "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
 )
-FREE_PARSER_MODEL = os.getenv("BOT_PARSER", "openrouter/google/gemma-4-31b-it:free")
+FREE_PARSER_MODEL = os.getenv("BOT_PARSER", "openrouter/nvidia/nemotron-3.5-lightning:free")
 PREDICTIONS = int(os.getenv("BOT_PREDICTIONS", "3"))
 MAX_QUESTIONS_PER_RUN = int(os.getenv("BOT_MAX_QUESTIONS", "4"))
 
